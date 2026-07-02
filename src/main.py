@@ -565,85 +565,6 @@ def _extra_story_content_sig(top: PostItem, monitor: FacebookPostMonitor | None)
     return hashlib.sha1(norm.encode("utf-8")).hexdigest() if norm else ""
 
 
-def _visual_phash_hamming(a: str, b: str) -> int:
-    """64-bit average hash hex (16 chars); Hamming distance. Mismatch shape → large distance."""
-    if not a or not b or len(a) != 16 or len(b) != 16:
-        return 999
-    try:
-        return (int(a, 16) ^ int(b, 16)).bit_count()
-    except ValueError:
-        return 999
-
-
-def _extra_feed_multimodal_step(
-    monitor: FacebookPostMonitor,
-    state: StateStore,
-    cfg,
-    source_label: str,
-    *,
-    dom_has_fresh_posts: bool,
-) -> None:
-    """页顶截图哈希 + 可选 OCR 文本：与上一轮对比；DOM 无新帖时可合并推送。"""
-    ts = datetime.now().strftime("%H:%M:%S")
-    notify_lines: list[str] = []
-    want_notify = False
-
-    vis = (getattr(monitor, "_last_feed_top_visual_hash", "") or "").strip()
-    if cfg.extra_feed_visual_enabled and vis:
-        prev = state.get_extra_feed_top_phash()
-        if prev:
-            dist = _visual_phash_hamming(vis, prev)
-            if dist >= cfg.extra_feed_visual_min_hamming:
-                print(
-                    f"[{ts}] {source_label} feed_visual_changed hamming={dist} "
-                    f"(页顶截图指纹变化，可能有新帖或广告/动画干扰)",
-                    flush=True,
-                )
-                notify_lines.append(f"截图指纹变化约 {dist} bit")
-                if cfg.extra_feed_visual_notify:
-                    want_notify = True
-        state.set_extra_feed_top_phash(vis)
-
-    ocr_raw = (getattr(monitor, "_last_feed_top_ocr_text", "") or "").strip()
-    ocr_norm = re.sub(r"\s+", " ", ocr_raw.lower())[:1200] if ocr_raw else ""
-    if cfg.extra_feed_ocr_enabled and len(ocr_norm) > 40:
-        prev_o = state.get_extra_feed_top_ocr_norm()
-        if prev_o and prev_o != ocr_norm:
-            print(
-                f"[{ts}] {source_label} feed_ocr_changed "
-                f"(页顶 OCR 文本相对上一轮有变化，节选 {len(ocr_norm)} 字)",
-                flush=True,
-            )
-            notify_lines.append("页顶 OCR 文本与上一轮不同（节选）:")
-            notify_lines.append(ocr_norm[:480])
-            if cfg.extra_feed_ocr_notify:
-                want_notify = True
-        state.set_extra_feed_top_ocr_norm(ocr_norm)
-
-    if (
-        want_notify
-        and notify_lines
-        and cfg.notify_enabled
-        and not dom_has_fresh_posts
-    ):
-        notify_new_post(
-            title="Facebook 页顶多信号变化",
-            message="\n".join(notify_lines) + f"\n\n{monitor.target_url}",
-            url=monitor.target_url,
-            open_in_browser=cfg.open_on_alert,
-            wecom_webhook_url=cfg.wecom_webhook_url,
-            serverchan_sendkey=cfg.serverchan_sendkey,
-            smtp_host=cfg.smtp_host,
-            smtp_port=cfg.smtp_port,
-            smtp_username=cfg.smtp_username,
-            smtp_password=cfg.smtp_password,
-            smtp_from=cfg.smtp_from,
-            email_to=cfg.email_to,
-            telegram_bot_token=cfg.telegram_bot_token,
-            telegram_chat_ids=cfg.telegram_chat_ids,
-        )
-
-
 def _log_fetched_latest(
     source_label: str,
     posts: list[PostItem],
@@ -731,14 +652,6 @@ def _extra_post_effective_age_seconds(post: PostItem) -> int | None:
     return _age_seconds_from_facebook_time_label(post.posted_at)
 
 
-def _extra_post_is_recent_enough(post: PostItem, max_age_seconds: int) -> bool:
-    """Extra 推送：data-utime 或时间文案（如 2h、Yesterday）在窗口内；避免仅靠误抓的旧 utime。"""
-    age = _extra_post_effective_age_seconds(post)
-    if age is None:
-        return False
-    return age <= max_age_seconds
-
-
 def _poll_extra_source(
     monitor: FacebookPostMonitor,
     state: StateStore,
@@ -766,12 +679,36 @@ def _poll_extra_source(
             else:
                 prev_sig = state.get_extra_last_story_content_sig()
                 new_sig_val = _extra_story_content_sig(posts[0], monitor)
-                # 重启后补推：磁盘有旧签名且与当前首帖不同 → 卡死期间可能有新帖，立即推送
-                if prev_sig and new_sig_val and prev_sig != new_sig_val and len(init_body.strip()) >= 10:
-                    ocr_time, _ocr_body = _extra_story_ocr_payload(monitor)
+                # 重启后补推：磁盘有旧签名且与当前首帖不同 → 卡死期间可能有新帖，立即推送。
+                # 两道护栏（与稳态路径对齐）：
+                # 1. OCR 帖子时间与上次已通知的相同 → 同一帖的渲染噪声，不推；
+                # 2. 能判断发帖时间且超出推送窗口（默认 48h）→ 旧帖，不推。
+                should_push = prev_sig and new_sig_val and prev_sig != new_sig_val and len(init_body.strip()) >= 10
+                ocr_time, _ocr_body = _extra_story_ocr_payload(monitor)
+                if should_push:
+                    prev_notified_ocr_time = state.get_extra_last_notified_ocr_time()
+                    if ocr_time and prev_notified_ocr_time and ocr_time == prev_notified_ocr_time:
+                        should_push = False
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] {source_label} "
+                            f"重启后签名变化但帖子时间未变（{ocr_time!r}），按渲染噪声忽略",
+                            flush=True,
+                        )
+                if should_push:
+                    age = _extra_post_effective_age_seconds(posts[0])
+                    if age is None:
+                        age = _age_seconds_from_facebook_time_label(ocr_time)
+                    if age is not None and age > cfg.extra_new_post_max_age_seconds:
+                        should_push = False
+                        print(
+                            f"[{datetime.now().strftime('%H:%M:%S')}] {source_label} "
+                            f"重启后签名变化但首帖已超出推送窗口（约 {age // 3600}h），不补推",
+                            flush=True,
+                        )
+                if should_push:
                     ts_now = datetime.now().strftime("%H:%M:%S")
                     print(
-                        f"[{ts_now}] {source_label} 重启后首轮签名已变更（卡死期间有新帖），直接推送",
+                        f"[{ts_now}] {source_label} 重启后首轮签名已变更（停机期间有新帖），补推通知",
                         flush=True,
                     )
                     if cfg.notify_enabled:
@@ -945,9 +882,8 @@ def main() -> None:
     print("Facebook Post Watcher started")
     _eh = cfg.extra_new_post_max_age_seconds / 3600.0
     print(
-        f"Extra 主页：未见过且符合 /用户名/posts/… 的链接记入 seen；"
-        f"发帖时间在最近 {_eh:g} 小时内才推送（data-utime 或时间文案如 2h、Yesterday 估算；"
-        f"两者都无法判断则不推）。",
+        f"Extra 主页：首条帖 OCR 内容签名变化且帖子时间文案变化 → 推送；"
+        f"重启后若签名与磁盘基线不同且发帖在 {_eh:g} 小时窗口内 → 补推（停机期间的新帖不丢）。",
         flush=True,
     )
     if cfg.target_url:
