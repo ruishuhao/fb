@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rena.facebook-watcher</string>
+  <key>WorkingDirectory</key>
+  <string>RENA_ROOT</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>RENA_ROOT/.venv/bin/python</string>
+    <string>-m</string>
+    <string>src.main</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>PLAYWRIGHT_BROWSERS_PATH</key>
+    <string>RENA_ROOT/.playwright-browsers</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>RENA_ROOT/logs/fb-watcher.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>RENA_ROOT/logs/fb-watcher.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,32 @@
+# Environment & secrets
+.env
+.env.*
+
+# Browser profile (large, machine-specific)
+.fb-browser-profile/
+
+# Playwright browser binaries (large, auto-downloaded)
+.playwright-browsers/
+
+# Logs & runtime state
+logs/
+*.pid
+.watcher_state*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
