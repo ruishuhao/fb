@@ -138,6 +138,10 @@ def _recover_browser_monitor(m: FacebookPostMonitor | None, label: str) -> None:
     print(f"[{ts}] {label}: auto-recovery — browser session closed, will reconnect on next fetch")
 
 
+# 主循环每轮开头更新；后台 watchdog 据此判断主线程是否卡死在 Playwright 调用里。
+_HEARTBEAT: dict[str, float] = {"ts": time.time()}
+
+
 def _latest_story_png_path() -> Path:
     return Path(__file__).resolve().parent.parent / "logs" / "fb_latest_post_story.png"
 
@@ -398,47 +402,21 @@ def _pkill_playwright_and_browser() -> None:
     """
     ts = datetime.now().strftime("%H:%M:%S")
     killed_any = False
-    # Kill Playwright's Node.js driver (blocks all IPC, unblocks every pending call)
-    r = subprocess.run(
-        ["pkill", "-9", "-f", "playwright/driver/node"],
-        capture_output=True,
-    )
-    if r.returncode == 0:
-        killed_any = True
-    # Kill Chromium browser processes ("Google Chrome for Testing" on macOS)
-    r = subprocess.run(
-        ["pkill", "-9", "-f", "ms-playwright"],
-        capture_output=True,
-    )
-    if r.returncode == 0:
-        killed_any = True
+    # 依次杀：Node 驱动、本项目 .playwright-browsers 下的浏览器、持有 .fb-browser-profile
+    # 锁的残留 chrome（残留进程握着 SingletonLock 会让重启后的持久化上下文启动失败/卡死）。
+    for pattern in (
+        "playwright/driver/node",
+        r"\.playwright-browsers",
+        r"\.fb-browser-profile",
+    ):
+        r = subprocess.run(
+            ["pkill", "-9", "-f", pattern],
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            killed_any = True
     if killed_any:
         print(f"[{ts}] watchdog_bg: force-killed playwright/browser OS processes", flush=True)
-
-
-def _reset_playwright_python_state(extra_sources: list[dict]) -> None:
-    """Reset Playwright's Python-side shared state after OS-level process kill.
-
-    After pkill kills the Node.js driver and browser, the main thread may still call
-    close() → playwright.stop(), which goes through the sync wrapper and tries to reach
-    the already-dead event loop, hanging indefinitely. By zeroing out the shared class
-    variables here, close() sees None everywhere and exits immediately without any IPC.
-    The next _ensure_browser() call then creates a completely fresh Playwright instance.
-
-    This is safe because we already killed the OS processes — there is nothing left to
-    communicate with. Any race with the main thread is benign: the worst case is that
-    main reads a non-None value and tries one more IPC call that fails with an exception.
-    """
-    from src.fb_monitor import FacebookPostMonitor  # local import to avoid circular
-    FacebookPostMonitor._shared_playwright = None
-    FacebookPostMonitor._shared_persistent_context = None
-    FacebookPostMonitor._shared_browser = None
-    FacebookPostMonitor._persistent_context_users = 0
-    FacebookPostMonitor._shared_context_users = 0
-    for source in extra_sources:
-        mon = source["monitor"]
-        mon._page = None   # type: ignore[attr-defined]
-        mon._context = None  # type: ignore[attr-defined]
 
 
 def _start_screenshot_watchdog_thread(
@@ -446,80 +424,64 @@ def _start_screenshot_watchdog_thread(
     cfg: AppConfig,
     stop_event: threading.Event,
 ) -> threading.Thread:
-    """Background watchdog: checks screenshot age every 30s independently of the main poll loop.
+    """Background watchdog: detects a hung main thread via the poll-loop heartbeat.
 
-    The loop-based watchdog only runs at the start of each iteration. If fetch_posts() hangs
-    inside Playwright, that watchdog never fires. This thread fires regardless.
+    2026-07-02 事故复盘：主线程卡死在 Playwright 同步 IPC 里时，pkill 驱动/浏览器进程
+    并不能可靠解除主线程阻塞（实测连杀 3 次仍卡死，共盲区 ~40 分钟），唯一可靠的恢复
+    手段是 SIGKILL 自身由 LaunchAgent（KeepAlive + ThrottleInterval=10s）重新拉起。
+    因此不再做「pkill → 等 → 再 pkill → 最后才自杀」的多级恢复，而是：
 
-    Recovery strategy (two-stage):
-    - 1st fire (age >= stale_threshold): pkill Playwright/browser processes. This breaks the
-      IPC pipe, which raises an exception in the main thread and unblocks it. monitor.close()
-      is NOT called here because Playwright's sync API is not thread-safe — calling it from a
-      background thread can't reach the main thread's event loop and does nothing.
-    - 2nd+ fire (still stale after pkill): pkill again; also send a push notification so the
-      user can manually verify no posts were missed.
+    - 主循环每轮更新 ``_HEARTBEAT``；正常一轮（抓取+sleep）约 65~110s，自动登录
+      最长约 150s。
+    - 心跳超过 ``WATCHER_STUCK_SUICIDE_SECONDS``（默认 300s）即判定卡死：
+      发一条告警（跨重启文件级 30 分钟冷却）→ pkill 浏览器进程（清掉握着
+      .fb-browser-profile 锁的残留 chrome，避免重启后再次卡死）→ SIGKILL 自身。
+    - seen/state 全部持久化在磁盘，重启后不丢通知；恢复总耗时 ≈ 阈值 + 10s 重启
+      + 一次抓取（~1 分钟），最坏 ~6 分钟内恢复推送。
+
+    截图过期但主线程活着的情况（登录墙、页面改版等）由主循环里的
+    ``_screenshot_watchdog_check`` 负责重建会话，这个线程不再管。
     """
-    stale_threshold = max(60, int(getattr(cfg, "screenshot_stale_seconds", 150) or 150))
-    cooldown = 180
-    alert_threshold = max(stale_threshold, 300)
-    alert_cooldown = 1800  # at most one stuck-browser alert every 30 minutes
+    stuck_suicide_seconds = max(
+        120, int(os.environ.get("WATCHER_STUCK_SUICIDE_SECONDS", "300") or 300)
+    )
+    alert_cooldown = 1800  # 跨进程重启的告警冷却，落盘存储
+    alert_ts_file = Path(__file__).resolve().parent.parent / "logs" / ".stuck_alert_last_ts"
+
+    def _alert_recently_sent(now: float) -> bool:
+        try:
+            return now - float(alert_ts_file.read_text().strip()) < alert_cooldown
+        except Exception:
+            return False
+
+    def _mark_alert_sent(now: float) -> None:
+        try:
+            alert_ts_file.write_text(str(now))
+        except Exception:
+            pass
 
     def _loop() -> None:
-        # Start with a full cooldown so the background watchdog doesn't fire immediately
-        # on startup when the screenshot is already stale (the loop-based watchdog and
-        # _ensure_browser handle first-run recovery; this thread only kicks in for hangs
-        # that occur AFTER the browser is already running).
-        last_recover_ts = time.time()
-        last_alert_ts = 0.0
-        consecutive_fires = 0
-
-        while not stop_event.wait(30):
-            age = _screenshot_age_seconds()
-            if age is None or age < stale_threshold:
-                consecutive_fires = 0  # screenshot is being updated — things are healthy
-                continue
+        while not stop_event.wait(15):
             now = time.time()
-            if now - last_recover_ts < cooldown:
+            hb_age = int(now - _HEARTBEAT["ts"])
+            if hb_age < stuck_suicide_seconds:
                 continue
-
-            consecutive_fires += 1
             ts = datetime.now().strftime("%H:%M:%S")
+            shot_age = _screenshot_age_seconds()
             print(
-                f"[{ts}] watchdog_bg: screenshot {age}s stale (fire #{consecutive_fires}) "
-                f"— force-killing playwright/browser processes",
+                f"[{ts}] watchdog_bg: main thread stuck — heartbeat {hb_age}s old "
+                f"(screenshot {shot_age}s) — pkill browsers + SIGKILL self for clean restart",
                 flush=True,
             )
-            _pkill_playwright_and_browser()
-            _reset_playwright_python_state(extra_sources)
-            last_recover_ts = now
-
-            # If pkill + state-reset haven't unblocked the main thread by fire #2 (~6 min
-            # stuck), Playwright's Python layer is in an unrecoverable deadlock. Self-SIGKILL
-            # so LaunchAgent restarts a clean process. All watcher state is persisted to disk.
-            if consecutive_fires >= 2:
-                print(
-                    f"[{ts}] watchdog_bg: pkill has not unblocked main thread after "
-                    f"{consecutive_fires} attempts — sending SIGKILL to self for clean restart",
-                    flush=True,
-                )
-                os.kill(os.getpid(), signal.SIGKILL)
-                return  # unreachable, but makes intent clear
-
-            # Send alert notification on the 2nd+ fire (pkill on 1st fire should have
-            # unblocked the main thread; still stuck means a persistent problem).
-            if (
-                consecutive_fires >= 2
-                and age >= alert_threshold
-                and now - last_alert_ts >= alert_cooldown
-                and cfg.notify_enabled
-            ):
+            if cfg.notify_enabled and not _alert_recently_sent(now):
                 target_url = (cfg.extra_target_urls[0] if cfg.extra_target_urls else cfg.target_url) or ""
                 try:
                     notify_new_post(
-                        title="⚠️ Facebook 监控浏览器卡死，请人工确认",
+                        title="⚠️ FB 监控卡死，已自动重启",
                         message=(
-                            f"截图已 {age // 60} 分 {age % 60} 秒未更新，监控程序已自动重建浏览器会话。\n"
-                            f"若此期间有新帖发出，可能存在遗漏，请手动查看：{target_url}"
+                            f"主线程已卡死 {hb_age // 60} 分 {hb_age % 60} 秒，"
+                            f"监控进程即将自动重启（约 1 分钟内恢复轮询）。\n"
+                            f"卡死期间若有新帖，恢复后会立即补推（48 小时窗口内）。"
                         ),
                         url=target_url,
                         open_in_browser=False,
@@ -534,16 +496,12 @@ def _start_screenshot_watchdog_thread(
                         telegram_bot_token=cfg.telegram_bot_token,
                         telegram_chat_ids=cfg.telegram_chat_ids,
                     )
-                    print(
-                        f"[{ts}] watchdog_bg: stuck-browser alert sent ({age}s stale)",
-                        flush=True,
-                    )
-                    last_alert_ts = now
+                    _mark_alert_sent(now)
                 except Exception as exc:
-                    print(
-                        f"[{ts}] watchdog_bg: stuck-browser alert failed: {exc}",
-                        flush=True,
-                    )
+                    print(f"[{ts}] watchdog_bg: stuck alert failed: {exc}", flush=True)
+            _pkill_playwright_and_browser()
+            os.kill(os.getpid(), signal.SIGKILL)
+            return  # unreachable, but makes intent clear
 
     t = threading.Thread(target=_loop, daemon=True, name="screenshot-watchdog")
     t.start()
@@ -806,8 +764,43 @@ def _poll_extra_source(
                     flush=True,
                 )
             else:
+                prev_sig = state.get_extra_last_story_content_sig()
+                new_sig_val = _extra_story_content_sig(posts[0], monitor)
+                # 重启后补推：磁盘有旧签名且与当前首帖不同 → 卡死期间可能有新帖，立即推送
+                if prev_sig and new_sig_val and prev_sig != new_sig_val and len(init_body.strip()) >= 10:
+                    ocr_time, _ocr_body = _extra_story_ocr_payload(monitor)
+                    ts_now = datetime.now().strftime("%H:%M:%S")
+                    print(
+                        f"[{ts_now}] {source_label} 重启后首轮签名已变更（卡死期间有新帖），直接推送",
+                        flush=True,
+                    )
+                    if cfg.notify_enabled:
+                        msg = (init_body or "(OCR 为空)")[:1200]
+                        if ocr_time:
+                            msg = f"{ocr_time}\n{msg}"
+                        try:
+                            notify_new_post(
+                                title="📢 Facebook 贴子有更新（重启后补推）",
+                                message=msg,
+                                url=monitor.target_url,
+                                open_in_browser=cfg.open_on_alert,
+                                wecom_webhook_url=cfg.wecom_webhook_url,
+                                serverchan_sendkey=cfg.serverchan_sendkey,
+                                smtp_host=cfg.smtp_host,
+                                smtp_port=cfg.smtp_port,
+                                smtp_username=cfg.smtp_username,
+                                smtp_password=cfg.smtp_password,
+                                smtp_from=cfg.smtp_from,
+                                email_to=cfg.email_to,
+                                telegram_bot_token=cfg.telegram_bot_token,
+                                telegram_chat_ids=cfg.telegram_chat_ids,
+                            )
+                        except Exception as _exc:
+                            print(f"[{ts_now}] {source_label} 补推通知失败: {_exc}", flush=True)
+                        if ocr_time:
+                            state.set_extra_last_notified_ocr_time(ocr_time)
                 state.set_extra_top_post_url((posts[0].url or "").strip())
-                state.set_extra_last_story_content_sig(_extra_story_content_sig(posts[0], monitor))
+                state.set_extra_last_story_content_sig(new_sig_val)
                 state.set_extra_last_story_clip_hash(
                     (getattr(monitor, "last_top_post_story_clip_hash", "") or "").strip()
                 )
@@ -1042,6 +1035,7 @@ def main() -> None:
         _start_screenshot_watchdog_thread(extra_sources, cfg, _watchdog_stop)
     while True:
         try:
+            _HEARTBEAT["ts"] = time.time()
             _maybe_truncate_watcher_out_log()
             last_force_recover_ts = _screenshot_watchdog_check(
                 extra_sources, cfg, last_force_recover_ts

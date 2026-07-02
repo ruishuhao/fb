@@ -1532,18 +1532,28 @@ class FacebookPostMonitor:
             try:
                 img = Image.open(io.BytesIO(png))
                 return (
-                    pytesseract.image_to_string(img, lang=self._extra_feed_ocr_lang) or ""
+                    pytesseract.image_to_string(
+                        img, lang=self._extra_feed_ocr_lang, timeout=60
+                    )
+                    or ""
                 ).strip()
             except Exception:
                 return ""
 
+        ex = ThreadPoolExecutor(max_workers=1)
         try:
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                return ex.submit(_work).result(timeout=75)
+            return ex.submit(_work).result(timeout=75)
         except FuturesTimeoutError:
             return ""
         except Exception:
             return ""
+        finally:
+            # Do NOT use `with ThreadPoolExecutor(...) as ex:` here — its __exit__ calls
+            # shutdown(wait=True), which blocks the main thread until the worker finishes.
+            # pytesseract's own `timeout=` above kills the underlying tesseract subprocess,
+            # so the worker should finish quickly; shutdown(wait=False) avoids re-introducing
+            # an indefinite hang if it somehow doesn't.
+            ex.shutdown(wait=False)
 
     @staticmethod
     def _crop_posts_column(png: bytes, posts_col_left_css: int, viewport_width: int) -> bytes:
@@ -1599,17 +1609,22 @@ class FacebookPostMonitor:
                 w, h = img.size
                 if w > 0 and w < 960:
                     img = img.resize((min(w * 2, 2000), min(h * 2, 2400)), _resample)
-                return (pytesseract.image_to_string(img, lang=use_lang) or "").strip()
+                return (
+                    pytesseract.image_to_string(img, lang=use_lang, timeout=60) or ""
+                ).strip()
             except Exception:
                 return ""
 
+        ex = ThreadPoolExecutor(max_workers=1)
         try:
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                return ex.submit(_work).result(timeout=75)
+            return ex.submit(_work).result(timeout=75)
         except FuturesTimeoutError:
             return ""
         except Exception:
             return ""
+        finally:
+            # See _ocr_png_bytes for why this must not be `with ThreadPoolExecutor(...) as ex:`.
+            ex.shutdown(wait=False)
 
     def _profile_home_first_story_evaluate(self) -> dict:
         slug = self._target_profile_slug()
@@ -2225,11 +2240,24 @@ class FacebookPostMonitor:
                 clip={"x": 0, "y": 0, "width": max(200, vw), "height": max(200, vh)},
             )
             ocr_on = self._extra_feed_ocr_enabled
-            with ThreadPoolExecutor(max_workers=2 if ocr_on else 1) as ex:
+            ex = ThreadPoolExecutor(max_workers=2 if ocr_on else 1)
+            try:
                 fut_h = ex.submit(self._average_hash_png_bytes, png)
                 fut_o = ex.submit(self._ocr_png_bytes, png) if ocr_on else None
-                self._last_feed_top_visual_hash = fut_h.result() or ""
-                self._last_feed_top_ocr_text = (fut_o.result() if fut_o else "") or ""
+                try:
+                    self._last_feed_top_visual_hash = fut_h.result(timeout=20) or ""
+                except FuturesTimeoutError:
+                    self._last_feed_top_visual_hash = ""
+                try:
+                    self._last_feed_top_ocr_text = (
+                        (fut_o.result(timeout=90) if fut_o else "") or ""
+                    )
+                except FuturesTimeoutError:
+                    self._last_feed_top_ocr_text = ""
+            finally:
+                # Avoid `with ThreadPoolExecutor(...) as ex:` — its __exit__ blocks on
+                # shutdown(wait=True) even after a submitted future has been abandoned above.
+                ex.shutdown(wait=False)
         except Exception:
             self._last_feed_top_visual_hash = ""
             self._last_feed_top_ocr_text = ""
@@ -3169,6 +3197,32 @@ class FacebookPostMonitor:
         except Exception:
             pass
 
+    @staticmethod
+    def _clear_stale_chromium_singleton_locks(user_data_dir: str) -> None:
+        """启动持久化 profile 前清理 Chromium 的 Singleton* 锁文件。
+
+        进程被 watchdog SIGKILL 后 Chromium 从未走正常退出流程，会在 profile 目录里
+        残留 SingletonLock / SingletonCookie / SingletonSocket。下次启动时 Chromium
+        认为已有实例占用该 profile，可能拒绝复用已保存的登录态（表现为「明明有持久化
+        profile，重启后却又要重新登录」），严重时甚至卡住启动。这里在每次重建
+        context 前主动删除，不影响 Cookies/Local Storage 等真正的会话数据。
+        """
+        if not user_data_dir:
+            return
+        try:
+            base = Path(user_data_dir)
+            if not base.is_dir():
+                return
+            for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                p = base / name
+                try:
+                    if p.exists() or p.is_symlink():
+                        p.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
     def _ensure_browser(self) -> None:
         if self._page is not None:
             return
@@ -3193,11 +3247,13 @@ class FacebookPostMonitor:
             if cls._shared_playwright is None:
                 cls._shared_playwright = sync_playwright().start()
             if cls._shared_persistent_context is None:
+                self._clear_stale_chromium_singleton_locks(self.browser_user_data_dir)
                 try:
                     cls._shared_persistent_context = (
                         cls._shared_playwright.chromium.launch_persistent_context(
                             self.browser_user_data_dir,
                             headless=self.headless,
+                            timeout=60000,
                             **_pc_args,
                         )
                     )
@@ -3209,6 +3265,7 @@ class FacebookPostMonitor:
                         cls._shared_playwright.chromium.launch_persistent_context(
                             self.browser_user_data_dir,
                             headless=self.headless,
+                            timeout=60000,
                             **_pc_args,
                         )
                     )
